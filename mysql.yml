@@ -1,0 +1,124 @@
+---
+- name: conf MySQL servers # выполняем настройку общих для двух серверов параметров 
+  hosts: all
+  become: true
+  tasks:
+  - name: Remove installed packages # удаляем ранее установленные пакеты MySQL, если они были предустановленны в ВМ
+    shell: |
+      yum list installed | grep {{ item }} | awk '{print $1}' | xargs yum remove -y
+      exit 0
+    loop:
+      - percona
+  # удаляем файлы ранее установленных пакетов MySQL, если они были предустановленны в ВМ  
+  - name: Remove files 
+    shell: "rm -rf {{ item }}"
+    loop:
+      - /etc/my.cnf_*
+      - /etc/my.cnf.d*
+      - /etc/my.cnf.d/
+      - /etc/my.cnf
+      - /var/lib/mysql/
+      - /var/log/mysqld.log
+  # устанавливаем percona-release пакет репозитория 
+  - name: Install https://repo.percona.com/yum/percona-release-latest.noarch.rpm
+    yum:
+      name: https://repo.percona.com/yum/percona-release-latest.noarch.rpm
+      state: present
+  # получаем наименование последней версии Percona-Server-server
+  - name: Get last Percona-Server-server version
+    shell: yum list | grep -i "Percona-Server-server." | sort | tail -1 | awk -F'.' '{print $1}'
+    register: last_percona_server_version
+  # помещаем наименование последней версии Percona-Server-server в переменную
+  - name: Print Last Percona Server version
+    debug: msg="Last Percona Server version is '{{ last_percona_server_version['stdout'] }}'"
+  # производим установку последней версии Percona-Server-server
+  - name: "Install last Percona Server version: {{ last_percona_server_version['stdout'] }}"
+    yum:
+      name: "{{ last_percona_server_version['stdout'] }}"
+      state: present
+  # копируем файлы настроек из материалов ДЗ на ВМ
+  - name: Collect /etc/my.cnf.d/ files
+    shell: cp /vagrant/conf/conf.d/* /etc/my.cnf.d/
+  # запускаем (перезапускаем) mysql
+  - name: Start MySQL
+    systemd:
+      state: restarted
+      name: mysql
+      enabled: true
+  # считываем временнный пароль (сгенерированный при установке) на root
+  - name: MySQL root password
+    shell: cat /var/log/mysqld.log | grep 'root@localhost:' | tail -1 | awk '{print $11}'
+    register: last_mysql_root_password
+  # помещаем временнный пароль (сгенерированный при установке) на root в переменную
+  - name: Print MySQL root password
+    debug: msg="MySQL root password is '{{ last_mysql_root_password['stdout'] }}'"
+  # заходим в mysql с временнным паролем на root и меняем его на свой 
+  - name: Mysql | ALTER ROOT USER
+    shell: mysql -uroot -p'{{ last_mysql_root_password['stdout'] }}' --connect-expired-password -e "ALTER USER USER() IDENTIFIED BY '{{ mysql_root_password }}';"
+  
+  - name: config master # приступаем к настройке параметров мастера
+    block:  
+      - name: Mysql | CREATE DATABASE `bet` # создаем тестовую базу bet
+        shell: mysql -uroot -p'{{ mysql_root_password }}' -e "DROP DATABASE IF EXISTS bet; CREATE DATABASE bet;"
+      # загружаем дамп из материалов ДЗ в созданню базу  
+      - name: Mysql | Restore database `bet`;
+        shell: mysql -uroot -p'{{ mysql_root_password }}' -D bet < /vagrant/bet.dmp
+      # создаем пользователя для репликации   
+      - name: Mysql | CREATE repl USER;
+        shell: mysql -uroot -p'{{ mysql_root_password }}' -e "CREATE USER 'repl'@'%' IDENTIFIED BY '{{ mysql_repl_password }}';GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%' IDENTIFIED BY '{{ mysql_repl_password }}';"
+        register: database_tables
+      # дампим базу для последующего залива на slave и игнорируем таблицs по задани
+      - name: Mysql | Dump database all master databases
+        shell: mysqldump --all-databases --triggers --routines --master-data --ignore-table=bet.events_on_demand --ignore-table=bet.v_same_event  -uroot -p'{{ mysql_root_password }}' > /home/vagrant/master.sql
+      # выгружаем файл дампа на хост машину 
+      - name: Download file from Remote Machine to Local ansible-node directory
+        become: yes
+        fetch:
+          src: /home/vagrant/master.sql
+          dest: /home/roman/MySQL/dump/
+          flat: yes
+      # перезапускаем mysql
+      - name: Start MySQL
+        systemd:
+          state: restarted
+          name: mysql
+      # настраиваем iptables (открываем порт) для работы репликации 
+      - name: Mysql | iptables
+        shell: |
+          iptables -I INPUT -p udp --dport 3306 -j ACCEPT
+          iptables -I INPUT -p tcp --dport 3306 --syn -j ACCEPT
+          iptables-save
+          exit 0
+        
+    when: (ansible_hostname == "master") # все действия по настройке роли мастера репликации выполняются на сервере master
+
+  - name: config slave # приступаем к настройке параметров slave
+    block:
+      - name: sed 01-base.cnf # меняем ID сервера mysql для slave (01-base.cnf из материалов ДЗ)
+        shell: sed -i 's/^server-id =.*/server-id = 2/g' /etc/my.cnf.d/01-base.cnf
+      # раскоментируем нужные строки в файле 05-binlog.cnf (из материалов ДЗ) (указываем таблицы которые будут игнорироваться при репликации)
+      - name: sed 05-inlog.cnf 
+        shell: sed '/replicate-ignore-table/s/^#//g' -i /etc/my.cnf.d/05-binlog.cnf
+      # перезапускаем mysql
+      - name: Start MySQL
+        systemd:
+          state: restarted
+          name: mysql
+      # копируем файл дампа БД с хоста на slave  
+      - name: Collect dump file
+        copy:
+          src: /home/roman/MySQL/dump/master.sql
+          dest: /vagrant/master.sql
+      # заливаем дамп мастера, подключаем и запускаем слейв
+      - name: Mysql | Configure SLAVE
+        shell: mysql -uroot -p'{{ mysql_root_password }}' -e "{{ item }}"
+        loop:
+          - "RESET MASTER;"
+          - "SOURCE /vagrant/master.sql;"
+          - "SHOW DATABASES LIKE 'bet';"
+          - "USE bet; SHOW TABLES;"
+          - "CHANGE MASTER TO MASTER_HOST='192.168.11.150', MASTER_PORT = 3306, MASTER_USER = 'repl', MASTER_PASSWORD = '{{ mysql_repl_password }}', MASTER_AUTO_POSITION = 1;"
+          - "START SLAVE;"
+        
+    when: (ansible_hostname == "slave") # все действия по настройке роли сервера репликации выполняются на сервере slave
+  
